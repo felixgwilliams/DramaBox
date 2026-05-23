@@ -18,7 +18,6 @@ Usage (multi-GPU with accelerate):
 
 import argparse
 import logging
-import math
 import os
 import random
 import shutil
@@ -28,21 +27,22 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from .audio_conditioning import AudioConditionByReferenceLatent
+from .log import logger
+
 REPO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ltx2"))
+
 # ltx-pipelines already on path via ltx2/
 
 MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Import audio conditioning item from our module
 sys.path.insert(0, MODEL_DIR)
-from audio_conditioning import AudioConditionByReferenceLatent
-
 
 # ─── Timestep Sampling ───
+
 
 class DistilledTimestepSampler:
     """Sample timesteps from the distilled sigma schedule.
@@ -53,12 +53,12 @@ class DistilledTimestepSampler:
     """
 
     # Distilled 8-step sigma values (boundaries of denoising intervals)
-    SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+    SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
 
     def __init__(self, jitter: float = 0.02):
         self.jitter = jitter
 
-    def sample(self, batch_size: int, seq_length: int = None, device: torch.device = None) -> torch.Tensor:
+    def sample(self, batch_size: int, seq_length: int | None = None, device: torch.device | None = None) -> torch.Tensor:  # noqa: ARG002
         n_intervals = len(self.SIGMAS) - 1
         interval_idx = torch.randint(0, n_intervals, (batch_size,), device=device)
         t = torch.rand(batch_size, device=device)
@@ -101,6 +101,7 @@ class ShiftedLogitNormalTimestepSampler:
 
 # ─── Dataset ───
 
+
 def build_speaker_map(index_paths, data_dirs):
     """Map speaker → [(data_dir, sample_idx)] from index file(s).
 
@@ -110,7 +111,7 @@ def build_speaker_map(index_paths, data_dirs):
     string-keyed indexes like tts_training_data_podcast).
     """
     speaker_to_samples = defaultdict(list)
-    for index_path, data_dir in zip(index_paths, data_dirs):
+    for index_path, data_dir in zip(index_paths, data_dirs, strict=True):
         with open(index_path) as f:
             for line_num, line in enumerate(f):
                 parts = line.strip().split("~")
@@ -135,8 +136,7 @@ class IDLoRADataset(Dataset):
     @classmethod
     def _load_silence_ref(cls):
         if cls._silence_ref is None:
-            p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "assets", "silence_latent_frame.pt")
+            p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "silence_latent_frame.pt")
             if os.path.exists(p):
                 cls._silence_ref = torch.load(p, weights_only=True).float().squeeze()  # [C, F]
         return cls._silence_ref
@@ -171,7 +171,7 @@ class IDLoRADataset(Dataset):
         cond_path = stripped if stripped.exists() else base / "conditions" / f"sample_{idx:06d}.pt"
         cond = torch.load(cond_path, weights_only=False)
         if isinstance(audio, dict):
-            audio = audio.get("audio_latent", audio.get("latent", list(audio.values())[0]))
+            audio = audio.get("audio_latent", audio.get("latent", next(iter(audio.values()))))
         if audio.dim() == 2:
             audio = audio.unsqueeze(0)
         audio_feats = cond.get("audio_prompt_embeds", cond.get("prompt_embeds"))
@@ -187,8 +187,7 @@ class IDLoRADataset(Dataset):
         target_L = ((L + REG - 1) // REG) * REG
         if target_L != L:
             pad_len = target_L - L
-            pad_emb = torch.zeros(pad_len, audio_feats.shape[1],
-                                  dtype=audio_feats.dtype)
+            pad_emb = torch.zeros(pad_len, audio_feats.shape[1], dtype=audio_feats.dtype)
             pad_mask = torch.zeros(pad_len, dtype=attn_mask.dtype)
             audio_feats = torch.cat([pad_emb, audio_feats], dim=0)
             attn_mask = torch.cat([pad_mask, attn_mask], dim=0)
@@ -223,13 +222,14 @@ class IDLoRADataset(Dataset):
 
 # ─── Model building ───
 
+
 def build_audio_only_model(checkpoint_path, device, dtype):
-    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
     from ltx_core.loader.registry import DummyRegistry
     from ltx_core.loader.sd_ops import SDOps
-    from ltx_core.model.transformer.model import LTXModel, LTXModelType
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
     from ltx_core.model.model_protocol import ModelConfigurator
     from ltx_core.model.transformer.attention import AttentionFunction
+    from ltx_core.model.transformer.model import LTXModel, LTXModelType
     from ltx_core.model.transformer.rope import LTXRopeType
 
     sd_ops = SDOps("AO").with_matching(prefix="model.diffusion_model.").with_replacement("model.diffusion_model.", "")
@@ -241,6 +241,7 @@ def build_audio_only_model(checkpoint_path, device, dtype):
             cp = None
             if not t.get("caption_proj_before_connector", False):
                 from ltx_core.model.transformer.text_projection import create_caption_projection
+
                 with torch.device("meta"):
                     cp = create_caption_projection(t, audio=True)
             return LTXModel(
@@ -264,14 +265,14 @@ def build_audio_only_model(checkpoint_path, device, dtype):
                 cross_attention_adaln=t.get("cross_attention_adaln", False),
             )
 
-    builder = Builder(model_path=checkpoint_path, model_class_configurator=Cfg,
-                      model_sd_ops=sd_ops, registry=DummyRegistry())
+    builder = Builder(model_path=checkpoint_path, model_class_configurator=Cfg, model_sd_ops=sd_ops, registry=DummyRegistry())
     return builder.build(device=device, dtype=dtype)
 
 
 def load_audio_connector(checkpoint_path, device, dtype):
     # ltx-trainer already on path via ltx2/
     from ltx_trainer.model_loader import load_embeddings_processor
+
     emb_proc = load_embeddings_processor(checkpoint_path, device=device, dtype=dtype)
     connector = emb_proc.audio_connector
     del emb_proc
@@ -280,36 +281,45 @@ def load_audio_connector(checkpoint_path, device, dtype):
 
 def apply_lora(model, rank, alpha, dropout=0.0):
     from peft import LoraConfig, get_peft_model
+
     config = LoraConfig(
-        r=rank, lora_alpha=alpha, lora_dropout=dropout, bias="none",
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        bias="none",
         target_modules=[
             # Self-attention over audio tokens (voice-transfer pathway via ref).
-            "audio_attn1.to_k", "audio_attn1.to_q", "audio_attn1.to_v", "audio_attn1.to_out.0",
+            "audio_attn1.to_k",
+            "audio_attn1.to_q",
+            "audio_attn1.to_v",
+            "audio_attn1.to_out.0",
             # Cross-attention (audio ↔ text context) NOT adapted — keep base
             # model's prompt→audio behaviour intact and rely on dataset balance
             # to drive expressiveness. (v15c tried this with adaLN unfreeze,
             # that proved too destructive; v16 tries it adaLN-frozen.)
             # FFN — non-linear capacity for style/phonetic adaptation.
-            "audio_ff.net.0.proj", "audio_ff.net.2",
+            "audio_ff.net.0.proj",
+            "audio_ff.net.2",
         ],
     )
     model = get_peft_model(model, config)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    logging.info(f"LoRA: {trainable:,} trainable / {total:,} total ({100*trainable/total:.1f}%)")
+    logger.info(f"LoRA: {trainable:,} trainable / {total:,} total ({100 * trainable / total:.1f}%)")
     return model
 
 
 @torch.no_grad()
 def prepare_audio_context(audio_connector, audio_features, attention_mask, device, dtype):
     from ltx_core.text_encoders.gemma.embeddings_processor import convert_to_additive_mask
+
     audio_features = audio_features.to(device=device, dtype=dtype)
     attention_mask = attention_mask.to(device=device)
     if audio_features.shape[0] > 1:
         results = []
         for i in range(audio_features.shape[0]):
-            feat_i = audio_features[i:i+1]
-            mask_i = attention_mask[i:i+1]
+            feat_i = audio_features[i : i + 1]
+            mask_i = attention_mask[i : i + 1]
             additive = convert_to_additive_mask(mask_i, feat_i.dtype)
             enc_i, _ = audio_connector(feat_i, additive)
             results.append(enc_i)
@@ -320,6 +330,7 @@ def prepare_audio_context(audio_connector, audio_features, attention_mask, devic
 
 
 # ─── Validation ───
+
 
 def _unwrap_model_safe(model):
     """Strip DDP / peft wrappers without going through accelerate.unwrap_model,
@@ -339,18 +350,25 @@ def run_validation(lora_path, val_config_path, output_dir, step, lora_rank=128):
     occupies the rest. Override via TRAIN_VAL_GPU env var.
     """
     import subprocess
+
     val_dir = os.path.join(output_dir, "validation", f"step_{step:05d}")
     os.makedirs(val_dir, exist_ok=True)
     script = os.path.join(os.path.dirname(__file__), "validate.py")
     cmd = [
-        sys.executable, script,
-        "--val-config", val_config_path,
-        "--output-dir", val_dir,
-        "--lora", lora_path,
-        "--lora-rank", str(lora_rank),
+        sys.executable,
+        script,
+        "--val-config",
+        val_config_path,
+        "--output-dir",
+        val_dir,
+        "--lora",
+        lora_path,
+        "--lora-rank",
+        str(lora_rank),
         # Use raw estimator output (no +10% buffer) so we can hear
         # whether the model needs more/less duration at current quality.
-        "--duration-multiplier", "1.0",
+        "--duration-multiplier",
+        "1.0",
     ]
     log_path = os.path.join(val_dir, "validate.log")
     env = os.environ.copy()
@@ -359,28 +377,37 @@ def run_validation(lora_path, val_config_path, output_dir, step, lora_rank=128):
     try:
         with open(log_path, "w") as logf:
             result = subprocess.run(
-                cmd, stdout=logf, stderr=subprocess.STDOUT, timeout=1800, env=env,
+                cmd,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                timeout=1800,
+                env=env,
+                check=False,
             )
         if result.returncode == 0:
-            logging.info(f"  Validation step {step}: OK → {val_dir}")
+            logger.info(f"  Validation step {step}: OK → {val_dir}")
         else:
-            logging.warning(f"  Validation step {step} FAILED (see {log_path})")
+            logger.warning(f"  Validation step {step} FAILED (see {log_path})")
     except subprocess.TimeoutExpired:
-        logging.warning(f"  Validation step {step} TIMEOUT (>30min)")
+        logger.warning(f"  Validation step {step} TIMEOUT (>30min)")
 
 
 # ─── Args ───
 
+
 def parse_args():
     # First pass: pull out --config so its values can become argparse defaults.
     cfg_parser = argparse.ArgumentParser(add_help=False)
-    cfg_parser.add_argument("--config", default=None,
-                            help="YAML file with default values for any of the flags below. "
-                                 "Explicit CLI flags still override the YAML.")
+    cfg_parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML file with default values for any of the flags below. Explicit CLI flags still override the YAML.",
+    )
     cfg_args, remaining = cfg_parser.parse_known_args()
     yaml_defaults: dict = {}
     if cfg_args.config:
         import yaml as _yaml
+
         with open(cfg_args.config) as f:
             yaml_defaults = _yaml.safe_load(f) or {}
         # YAML keys are dashes-or-underscores → normalize to argparse dest (underscore).
@@ -393,31 +420,60 @@ def parse_args():
         parents=[cfg_parser],
         description="Audio-Only IC-LoRA Training for Voice Cloning",
     )
-    p.add_argument("--data-dir", required="data_dir" not in yaml_defaults,
-                   nargs="+", default=_yaml("data_dir", None))
-    p.add_argument("--speaker-index", required="speaker_index" not in yaml_defaults,
-                   nargs="+", default=_yaml("speaker_index", None))
+    p.add_argument("--data-dir", required="data_dir" not in yaml_defaults, nargs="+", default=_yaml("data_dir", None))
+    p.add_argument(
+        "--speaker-index",
+        required="speaker_index" not in yaml_defaults,
+        nargs="+",
+        default=_yaml("speaker_index", None),
+    )
     p.add_argument("--output-dir", default=_yaml("output_dir", os.path.join(MODEL_DIR, "tts_iclora_v1")))
     p.add_argument("--checkpoint", default=_yaml("checkpoint", os.path.join(MODEL_DIR, "dramabox-dit-v1.safetensors")))
-    p.add_argument("--full-checkpoint", default=_yaml("full_checkpoint", os.path.join(MODEL_DIR, "dramabox-audio-components.safetensors")))
-    p.add_argument("--base-model", choices=["distilled", "dev"], default=_yaml("base_model", "dev"),
-                   help="Base model type: distilled uses DistilledTimestepSampler, dev uses ShiftedLogitNormal")
+    p.add_argument(
+        "--full-checkpoint",
+        default=_yaml("full_checkpoint", os.path.join(MODEL_DIR, "dramabox-audio-components.safetensors")),
+    )
+    p.add_argument(
+        "--base-model",
+        choices=["distilled", "dev"],
+        default=_yaml("base_model", "dev"),
+        help="Base model type: distilled uses DistilledTimestepSampler, dev uses ShiftedLogitNormal",
+    )
     p.add_argument("--lora-rank", type=int, default=_yaml("lora_rank", 128))
     p.add_argument("--lora-alpha", type=int, default=_yaml("lora_alpha", 128))
-    p.add_argument("--lora-dropout", type=float, default=_yaml("lora_dropout", 0.0),
-                   help="Dropout applied to LoRA A/B matrices during training. "
-                        "Recommended ~0.1 for small datasets to regularize.")
+    p.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=_yaml("lora_dropout", 0.0),
+        help="Dropout applied to LoRA A/B matrices during training. Recommended ~0.1 for small datasets to regularize.",
+    )
     p.add_argument("--resume-lora", default=_yaml("resume_lora", None))
-    p.add_argument("--resume-step-offset", type=int, default=_yaml("resume_step_offset", None),
-                   help="Step to add when naming saved checkpoints. If None, inferred "
-                        "from --resume-lora filename (e.g. lora_step_10000.safetensors → 10000). "
-                        "Set to 0 to start numbering at 0 regardless.")
-    p.add_argument("--ref-ratio", type=float, default=_yaml("ref_ratio", 0.3),
-                   help="Fraction of target length to use as reference (default 0.3)")
-    p.add_argument("--max-ref-tokens", type=int, default=_yaml("max_ref_tokens", 200),
-                   help="Maximum reference tokens after patchification (default 200)")
-    p.add_argument("--text-dropout", type=float, default=_yaml("text_dropout", 0.0),
-                   help="Probability of dropping text conditioning (forces reliance on voice ref)")
+    p.add_argument(
+        "--resume-step-offset",
+        type=int,
+        default=_yaml("resume_step_offset", None),
+        help="Step to add when naming saved checkpoints. If None, inferred "
+        "from --resume-lora filename (e.g. lora_step_10000.safetensors → 10000). "
+        "Set to 0 to start numbering at 0 regardless.",
+    )
+    p.add_argument(
+        "--ref-ratio",
+        type=float,
+        default=_yaml("ref_ratio", 0.3),
+        help="Fraction of target length to use as reference (default 0.3)",
+    )
+    p.add_argument(
+        "--max-ref-tokens",
+        type=int,
+        default=_yaml("max_ref_tokens", 200),
+        help="Maximum reference tokens after patchification (default 200)",
+    )
+    p.add_argument(
+        "--text-dropout",
+        type=float,
+        default=_yaml("text_dropout", 0.0),
+        help="Probability of dropping text conditioning (forces reliance on voice ref)",
+    )
     p.add_argument("--steps", type=int, default=_yaml("steps", 30000))
     p.add_argument("--lr", type=float, default=_yaml("lr", 3e-5))
     p.add_argument("--lr-scheduler", choices=["cosine", "linear", "constant"], default=_yaml("lr_scheduler", "cosine"))
@@ -433,6 +489,7 @@ def parse_args():
 
 
 # ─── Main ───
+
 
 def main():
     from accelerate import Accelerator
@@ -460,6 +517,7 @@ def main():
     # Save training args
     if is_main:
         import yaml
+
         args_dict = vars(args).copy()
         args_dict["_meta"] = {
             "world_size": accelerator.num_processes,
@@ -472,46 +530,44 @@ def main():
             yaml.dump(args_dict, f, default_flow_style=False, sort_keys=False)
 
     from ltx_core.components.patchifiers import AudioPatchifier
-    from ltx_core.model.transformer.modality import Modality
     from ltx_core.guidance.perturbations import BatchedPerturbationConfig
     from ltx_core.tools import AudioLatentTools
     from ltx_core.types import AudioLatentShape, LatentState
-    from ltx_pipelines.utils.helpers import modality_from_latent_state, timesteps_from_mask
+    from ltx_pipelines.utils.helpers import modality_from_latent_state
 
     # Build speaker map
     if is_main:
-        logging.info("Building speaker map...")
+        logger.info("Building speaker map...")
     speaker_map = build_speaker_map(args.speaker_index, args.data_dir)
     if is_main:
-        logging.info(f"Speaker map: {len(speaker_map)} speakers, "
-                     f"{sum(len(v) for v in speaker_map.values())} samples")
+        logger.info(f"Speaker map: {len(speaker_map)} speakers, {sum(len(v) for v in speaker_map.values())} samples")
 
     # Load model
     if is_main:
-        logging.info("Loading audio-only model...")
+        logger.info("Loading audio-only model...")
     model = build_audio_only_model(args.checkpoint, device, dtype)
 
     if is_main:
-        logging.info("Loading audio connector...")
+        logger.info("Loading audio connector...")
     audio_connector = load_audio_connector(args.full_checkpoint, device, dtype)
     audio_connector.eval()
     for p in audio_connector.parameters():
         p.requires_grad = False
 
     if is_main:
-        logging.info(f"Applying LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})...")
+        logger.info(f"Applying LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})...")
     model = apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
 
     # Resume from checkpoint
     if args.resume_lora:
         from safetensors.torch import load_file as st_load
+
         if is_main:
-            logging.info(f"Resuming from: {args.resume_lora}")
+            logger.info(f"Resuming from: {args.resume_lora}")
         lora_sd = st_load(args.resume_lora)
         mapped = {}
         for k, v in lora_sd.items():
-            nk = k.replace(".lora_A.weight", ".lora_A.default.weight").replace(
-                ".lora_B.weight", ".lora_B.default.weight")
+            nk = k.replace(".lora_A.weight", ".lora_A.default.weight").replace(".lora_B.weight", ".lora_B.default.weight")
             mapped[nk] = v
         model.load_state_dict(mapped, strict=False)
 
@@ -522,12 +578,13 @@ def main():
         resume_offset = 0
         if args.resume_lora:
             import re as _re
+
             m = _re.search(r"lora_step_(\d+)", os.path.basename(args.resume_lora))
             if m:
                 resume_offset = int(m.group(1))
         args.resume_step_offset = resume_offset
     if is_main and args.resume_step_offset:
-        logging.info(f"Save-step offset: +{args.resume_step_offset}")
+        logger.info(f"Save-step offset: +{args.resume_step_offset}")
 
     model.train()
     model.base_model.model.set_gradient_checkpointing(True)
@@ -535,7 +592,7 @@ def main():
     # Dataset & DataLoader
     dataset = IDLoRADataset(speaker_map)
     if is_main:
-        logging.info(f"Dataset: {len(dataset)} samples, {len(dataset.speaker_map)} speakers")
+        logger.info(f"Dataset: {len(dataset)} samples, {len(dataset.speaker_map)} speakers")
 
     def collate_fn(batch):
         """Pad variable-length audio to max in batch, track real lengths for loss masking."""
@@ -575,16 +632,26 @@ def main():
             "ref_lengths": torch.tensor(ref_lengths),
         }
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2,
-                            pin_memory=True, drop_last=True, collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
 
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01,
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
     )
 
-    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, ConstantLR
+    from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+
     warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=args.warmup_steps)
     remaining = args.steps - args.warmup_steps
     if args.lr_scheduler == "cosine":
@@ -618,19 +685,21 @@ def main():
     if args.base_model == "distilled":
         timestep_sampler = DistilledTimestepSampler()
         if is_main:
-            logging.info("Using DistilledTimestepSampler (matching distilled model sigmas)")
+            logger.info("Using DistilledTimestepSampler (matching distilled model sigmas)")
     else:
         timestep_sampler = ShiftedLogitNormalTimestepSampler()
         if is_main:
-            logging.info("Using ShiftedLogitNormalTimestepSampler (dev model)")
+            logger.info("Using ShiftedLogitNormalTimestepSampler (dev model)")
 
     # Training loop
     if is_main:
-        logging.info(f"Training: {args.steps} steps, lr={args.lr}, scheduler={args.lr_scheduler}, "
-                     f"batch={args.batch_size}, grad_accum={args.grad_accum}, "
-                     f"world_size={accelerator.num_processes}, "
-                     f"ref_ratio={args.ref_ratio}, max_ref_tokens={args.max_ref_tokens}")
-        logging.info("IC-LoRA pattern: ref tokens APPENDED to target, loss on target only")
+        logger.info(
+            f"Training: {args.steps} steps, lr={args.lr}, scheduler={args.lr_scheduler}, "
+            f"batch={args.batch_size}, grad_accum={args.grad_accum}, "
+            f"world_size={accelerator.num_processes}, "
+            f"ref_ratio={args.ref_ratio}, max_ref_tokens={args.max_ref_tokens}"
+        )
+        logger.info("IC-LoRA pattern: ref tokens APPENDED to target, loss on target only")
 
     data_iter = iter(dataloader)
     step = 0
@@ -670,18 +739,18 @@ def main():
             pad_frames = random.randint(0, max_pad_frames)
             if pad_frames > 0:
                 C, F_dim = tgt_latent.shape[1], tgt_latent.shape[3]
-                if not hasattr(args, '_silence_frame') or args._silence_frame is None:
+                if not hasattr(args, "_silence_frame") or args._silence_frame is None:  # noqa: SLF001
                     _sf_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "silence_latent_frame.pt")
                     if os.path.exists(_sf_path):
-                        args._silence_frame = torch.load(_sf_path, weights_only=True)  # [C, 1, F]
+                        args._silence_frame = torch.load(_sf_path, weights_only=True)  # [C, 1, F]# noqa: SLF001
                         if is_main:
-                            logging.info(f"Loaded silence latent from {_sf_path}")
+                            logger.info(f"Loaded silence latent from {_sf_path}")
                     else:
-                        args._silence_frame = False  # fallback to zeros
+                        args._silence_frame = False  # fallback to zeros# noqa: SLF001
                         if is_main:
-                            logging.warning(f"silence_latent_frame.pt not found, using zeros")
-                if args._silence_frame is not False:
-                    sf = args._silence_frame.to(dtype=dtype, device=device)  # [C, 1, F]
+                            logger.warning("silence_latent_frame.pt not found, using zeros")
+                if args._silence_frame is not False:  # noqa: SLF001
+                    sf = args._silence_frame.to(dtype=dtype, device=device)  # [C, 1, F]# noqa: SLF001
                     silence_pad = sf.unsqueeze(0).expand(B, -1, pad_frames, -1)  # [B, C, pad, F]
                 else:
                     silence_pad = torch.zeros(B, C, pad_frames, F_dim, dtype=dtype, device=device)
@@ -699,7 +768,7 @@ def main():
                 batch=B,
                 channels=tgt_latent.shape[1],  # 8
                 frames=tgt_T_frames,
-                mel_bins=tgt_latent.shape[3],   # 16
+                mel_bins=tgt_latent.shape[3],  # 16
             )
 
             audio_tools = AudioLatentTools(
@@ -769,9 +838,7 @@ def main():
             # Text conditioning dropout: randomly zero out text context to force
             # the model to rely on the voice reference for identity/style.
             with torch.no_grad():
-                audio_context = prepare_audio_context(
-                    audio_connector, batch["audio_features"],
-                    batch["attention_mask"], device, dtype)
+                audio_context = prepare_audio_context(audio_connector, batch["audio_features"], batch["attention_mask"], device, dtype)
                 if args.text_dropout > 0 and random.random() < args.text_dropout:
                     audio_context = torch.zeros_like(audio_context)
 
@@ -824,10 +891,10 @@ def main():
             elapsed = time.time() - t0
             sps = step / elapsed if elapsed > 0 else 0
             eta = (args.steps - step) / sps if sps > 0 else 0
-            logging.info(
+            logger.info(
                 f"Step {step}/{args.steps} | loss={avg_loss:.4f} | lr={lr:.2e} | "
                 f"tgt_T={tgt_T} ref_T={ref_T_frames} total={tgt_T + ref_T_frames} | "
-                f"{sps:.1f} steps/s | ETA {eta/60:.0f}min"
+                f"{sps:.1f} steps/s | ETA {eta / 60:.0f}min"
             )
 
             # Save best whenever loss improves — no warmup gate, so we can
@@ -844,14 +911,14 @@ def main():
                     shutil.copy(adapter, new_best)
                 if old_best != new_best and os.path.exists(old_best):
                     os.remove(old_best)
-                logging.info(f"New best: loss={best_loss:.4f} at step {best_step}")
+                logger.info(f"New best: loss={best_loss:.4f} at step {best_step}")
 
             accum_loss = 0.0
 
         if is_opt_step and step % args.save_every == 0 and is_main:
             global_step = step + args.resume_step_offset
             save_path = os.path.join(args.output_dir, f"lora_step_{global_step:05d}.safetensors")
-            logging.info(f"Saving: {save_path}")
+            logger.info(f"Saving: {save_path}")
             unwrapped = _unwrap_model_safe(model)
             unwrapped.save_pretrained(args.output_dir)
             adapter = os.path.join(args.output_dir, "adapter_model.safetensors")
@@ -859,10 +926,9 @@ def main():
                 shutil.copy(adapter, save_path)
 
             if args.val_config:
-                logging.info(f"Running validation at step {global_step}...")
+                logger.info(f"Running validation at step {global_step}...")
                 model.eval()
-                run_validation(save_path, args.val_config, args.output_dir, global_step,
-                               lora_rank=args.lora_rank)
+                run_validation(save_path, args.val_config, args.output_dir, global_step, lora_rank=args.lora_rank)
                 model.train()
 
     # Final save
@@ -874,8 +940,8 @@ def main():
         save_path = os.path.join(args.output_dir, f"lora_step_{global_step:05d}.safetensors")
         if os.path.exists(adapter):
             shutil.copy(adapter, save_path)
-        logging.info(f"Training complete! {step} steps in {time.time()-t0:.0f}s")
-        logging.info(f"Best loss: {best_loss:.4f} at step {best_step}")
+        logger.info(f"Training complete! {step} steps in {time.time() - t0:.0f}s")
+        logger.info(f"Best loss: {best_loss:.4f} at step {best_step}")
 
 
 if __name__ == "__main__":

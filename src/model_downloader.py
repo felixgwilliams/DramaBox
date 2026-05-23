@@ -5,6 +5,7 @@ Download Dramabox models from HuggingFace.
 Models are cached locally after first download.
 Gemma text encoder is fetched separately from Google's repo.
 """
+
 import logging
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ MODEL_FILES = {
 }
 
 
-def get_model_path(name: str, cache_dir: str = None) -> str:
+def get_model_path(name: str, cache_dir: str | None = None) -> str:
     """Download a model file from HF and return local path.
 
     Args:
@@ -41,7 +42,8 @@ def get_model_path(name: str, cache_dir: str = None) -> str:
     cache_dir = cache_dir or DEFAULT_CACHE
 
     if name not in MODEL_FILES:
-        raise ValueError(f"Unknown model: {name}. Choose from: {list(MODEL_FILES.keys())}")
+        msg = f"Unknown model: {name}. Choose from: {list(MODEL_FILES.keys())}"
+        raise ValueError(msg)
 
     repo_path = MODEL_FILES[name]
     logger.info(f"Fetching {name} from {DRAMABOX_REPO}/{repo_path}...")
@@ -56,7 +58,7 @@ def get_model_path(name: str, cache_dir: str = None) -> str:
     return local_path
 
 
-def get_gemma_path(cache_dir: str = None) -> str:
+def get_gemma_path(cache_dir: str | None = None) -> str:
     """Download Gemma 3 12B IT (pre-quantized bnb-4bit via unsloth) and return
     the snapshot directory. Using the pre-quantized variant skips runtime
     bitsandbytes quantization and ~halves the Gemma load time.
@@ -73,7 +75,7 @@ def get_gemma_path(cache_dir: str = None) -> str:
     return local_dir
 
 
-def get_reuse_code_path(cache_dir: str = None) -> str:
+def get_reuse_code_path(cache_dir: str | None = None) -> str:
     """Fetch the nvidia/RE-USE code + configs needed by REUSEUpsampler.
 
     Only the .py / .yaml / .json files are pulled (~150 KB) — the 38 MB
@@ -102,14 +104,13 @@ def get_reuse_code_path(cache_dir: str = None) -> str:
         repo_id=REUSE_REPO,
         cache_dir=cache_dir,
         token=os.environ.get("HF_TOKEN"),
-        allow_patterns=["*.py", "*.yaml", "*.json",
-                        "recipes/*", "models/*.py", "utils/*.py"],
+        allow_patterns=["*.py", "*.yaml", "*.json", "recipes/*", "models/*.py", "utils/*.py"],
     )
     logger.info(f"  -> {local_dir}")
     return local_dir
 
 
-def get_all_paths(cache_dir: str = None) -> dict:
+def get_all_paths(cache_dir: str | None = None) -> dict:
     """Download all required models and return paths dict.
 
     Returns:

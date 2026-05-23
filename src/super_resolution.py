@@ -7,26 +7,27 @@ this module is cheap.
     up = REUSEUpsampler(target_sr=48000, device="cuda")
     clean, sr = up(wav, in_sr=24000)        # wav: (C, T) or (T,) float
 """
+
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
 
 import torch
 
+from .log import logger
 
 # REUSE_DIR is resolved lazily via model_downloader.get_reuse_code_path on
 # first use of REUSEUpsampler — it returns the vendored third_party/RE-USE/
 # tree if present, otherwise snapshot-downloads just the code from HF.
-_REUSE_DIR: Optional[Path] = None
+_REUSE_DIR: Path | None = None
 
 
 def _resolve_reuse_dir() -> Path:
-    global _REUSE_DIR
+    global _REUSE_DIR  # noqa: PLW0603
     if _REUSE_DIR is None:
-        from model_downloader import get_reuse_code_path
+        from .model_downloader import get_reuse_code_path
+
         _REUSE_DIR = Path(get_reuse_code_path())
     return _REUSE_DIR
 
@@ -44,7 +45,7 @@ def _check_reuse_deps() -> None:
         # Use the pip-package names (mamba-ssm, not mamba_ssm) in the message
         # so copy-paste works.
         pkgs = [m.replace("_", "-") for m in missing]
-        raise ImportError(
+        msg = (
             "Voice-reference denoising (RE-USE) requires optional dependencies "
             f"not currently installed: {', '.join(pkgs)}.\n\n"
             "    pip install -r requirements-reuse.txt\n\n"
@@ -53,10 +54,12 @@ def _check_reuse_deps() -> None:
             "nvcc on Linux. To run without RE-USE, pass denoise_ref=False or "
             "untick 'Denoise voice reference' in the Gradio UI."
         )
+        raise ImportError(msg)
 
 
 def _module_missing(name: str) -> bool:
     import importlib.util
+
     return importlib.util.find_spec(name) is None
 
 
@@ -75,7 +78,7 @@ class REUSEUpsampler:
     def __init__(
         self,
         target_sr: int = 48000,
-        config_path: Optional[str] = None,
+        config_path: str | None = None,
         chunk_size_s: float = 1.0,
         hop_portion: float = 0.5,
         device: str | torch.device = "cuda",
@@ -96,7 +99,7 @@ class REUSEUpsampler:
         # Config path is resolved lazily on first use (alongside the code tree)
         # so importing this module never triggers a download.
         self._config_path_override = Path(config_path) if config_path else None
-        self.config_path: Optional[Path] = None
+        self.config_path: Path | None = None
         self._model = None
         self._cfg = None
         self._stft_fns = None  # (mag_phase_stft, mag_phase_istft, compress_factor, pad_or_trim)
@@ -115,26 +118,30 @@ class REUSEUpsampler:
         (~5-10x slower).
         """
         try:
-            import selective_scan_cuda  # noqa: F401
             import mamba_ssm  # noqa: F401
-            return  # Fast path: kernel present.
+            import selective_scan_cuda  # noqa: F401
+
         except ImportError:
             pass
+        else:
+            return  # Fast path: kernel present.
 
         import types
+
         if "selective_scan_cuda" not in sys.modules:
             stub = types.ModuleType("selective_scan_cuda")
+
             def _missing(*a, **kw):  # pragma: no cover - safety net only
-                raise NotImplementedError(
-                    "selective_scan_cuda kernel missing; the call should have "
-                    "been routed to selective_scan_ref via the runtime patch."
-                )
+                msg = "selective_scan_cuda kernel missing; the call should have been routed to selective_scan_ref via the runtime patch."
+                raise NotImplementedError(msg)
+
             stub.fwd = _missing
             stub.bwd = _missing
             sys.modules["selective_scan_cuda"] = stub
 
-        from mamba_ssm.ops import selective_scan_interface as ssi
         from mamba_ssm.modules import mamba_simple
+        from mamba_ssm.ops import selective_scan_interface as ssi
+
         if getattr(ssi, "_dramabox_kernel_free_patch_applied", False):
             return
         ssi.selective_scan_fn = ssi.selective_scan_ref
@@ -143,11 +150,8 @@ class REUSEUpsampler:
         # rebind there too, otherwise Mamba.forward keeps the original handles.
         mamba_simple.selective_scan_fn = ssi.selective_scan_ref
         mamba_simple.mamba_inner_fn = ssi.mamba_inner_ref
-        ssi._dramabox_kernel_free_patch_applied = True
-        logging.info(
-            "mamba_ssm kernel missing - using kernel-free fallback "
-            "(selective_scan_fn -> selective_scan_ref). Expect ~5-10x slowdown."
-        )
+        ssi._dramabox_kernel_free_patch_applied = True  # noqa: SLF001
+        logger.info("mamba_ssm kernel missing - using kernel-free fallback (selective_scan_fn -> selective_scan_ref). Expect ~5-10x slowdown.")
 
     def _lazy_load(self) -> None:
         if self._model is not None:
@@ -164,12 +168,11 @@ class REUSEUpsampler:
 
         if self.config_path is None:
             self.config_path = self._config_path_override or (
-                reuse_dir / "recipes" /
-                "USEMamba_30x1_lr_00002_norm_05_vq_065_nfft_320_hop_40_NRIR_012_pha_0005_com_04_early_001.yaml"
+                reuse_dir / "recipes" / "USEMamba_30x1_lr_00002_norm_05_vq_065_nfft_320_hop_40_NRIR_012_pha_0005_com_04_early_001.yaml"
             )
 
         from models.generator_SEMamba_time_d4 import SEMamba  # type: ignore
-        from models.stfts import mag_phase_stft, mag_phase_istft  # type: ignore
+        from models.stfts import mag_phase_istft, mag_phase_stft  # type: ignore
         from utils.util import load_config, pad_or_trim_to_match  # type: ignore
 
         self._cfg = load_config(str(self.config_path))
@@ -181,15 +184,15 @@ class REUSEUpsampler:
         model.train(False)
         self._model = model
         n_params = sum(p.numel() for p in model.parameters())
-        logging.info(f"RE-USE loaded: SEMamba ({n_params / 1e6:.1f}M params) -> {self.target_sr} Hz")
+        logger.info(f"RE-USE loaded: SEMamba ({n_params / 1e6:.1f}M params) -> {self.target_sr} Hz")
 
     @staticmethod
     def _make_even(v: float) -> int:
-        v = int(round(v))
+        v = round(v)
         return v if v % 2 == 0 else v + 1
 
     @torch.inference_mode()
-    def __call__(self, waveform: torch.Tensor, in_sr: int = 16000) -> Tuple[torch.Tensor, int]:
+    def __call__(self, waveform: torch.Tensor, in_sr: int = 16000) -> tuple[torch.Tensor, int]:
         """Chunked overlap-add denoise / BWE (ports nvidia/RE-USE inference_chunk.py).
 
         Peak VRAM is bounded by ``chunk_size_s * target_sr`` rather than the
@@ -197,8 +200,10 @@ class REUSEUpsampler:
         a Hann-window normalized overlap-add with default 50% hop.
         """
         import math
+
         self._lazy_load()
         import librosa
+
         mag_phase_stft, mag_phase_istft, compress_factor, pad_or_trim_to_match = self._stft_fns
 
         # STFT params are scaled relative to the config's training rate (8000).
@@ -213,9 +218,7 @@ class REUSEUpsampler:
         # 1. Resample to target rate first (skips if target_sr == in_sr).
         if self.target_sr != in_sr:
             wav_np = waveform.cpu().float().numpy()
-            wav_np = librosa.resample(
-                wav_np, orig_sr=in_sr, target_sr=self.target_sr, res_type="kaiser_best"
-            )
+            wav_np = librosa.resample(wav_np, orig_sr=in_sr, target_sr=self.target_sr, res_type="kaiser_best")
             wav = torch.from_numpy(wav_np).to(self.device, dtype=torch.float32)
         else:
             wav = waveform.to(self.device, dtype=torch.float32)
@@ -236,16 +239,21 @@ class REUSEUpsampler:
         n_chunks = max(1, math.ceil((total - chunk_size) / hop_length) + 1) if total > chunk_size else 1
 
         for c in range(n_ch):
-            ch_in = wav[c : c + 1]                              # (1, T)
+            ch_in = wav[c : c + 1]  # (1, T)
             for i in range(n_chunks):
                 start = i * hop_length
                 end = min(start + chunk_size, total)
                 chunk = ch_in[:, start:end]
-                if chunk.shape[-1] < 2:                          # skip degenerate tail
+                if chunk.shape[-1] < 2:  # skip degenerate tail
                     continue
                 noisy_mag, noisy_pha, _ = mag_phase_stft(
-                    chunk, n_fft=n_fft, hop_size=hop, win_size=win,
-                    compress_factor=compress_factor, center=True, addeps=False,
+                    chunk,
+                    n_fft=n_fft,
+                    hop_size=hop,
+                    win_size=win,
+                    compress_factor=compress_factor,
+                    center=True,
+                    addeps=False,
                 )
                 amp_g, pha_g, _ = self._model(noisy_mag, noisy_pha)
                 # "Sweep artifact" filter — match the official inference.

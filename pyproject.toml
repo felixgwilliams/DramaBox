@@ -2,7 +2,7 @@
 name = "dramabox"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 dependencies = [
   "accelerate>=0.25.0",
   "av>=12.0.0",
@@ -47,6 +47,44 @@ packages = ["src", "ltx2/ltx_core", "ltx2/ltx_pipelines", "ltx2/ltx_trainer"]
 "ltx2/ltx_core" = "ltx_core"
 "ltx2/ltx_pipelines" = "ltx_pipelines"
 "ltx2/ltx_trainer" = "ltx_trainer"
+
+[tool.ruff]
+line-length = 160
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "D",
+  "S",
+  "ANN",
+  "COM",  # trailing commas are not needed
+  "ERA",  # allow commented code
+  "ISC001",  # conflicts with formatter
+  "PTH",  # allow opening files without pathlib
+  "TRY003",  # allow exception messages as string literals
+  "TD",  # allow FIXME messages
+  "FIX",  # allow FIXME messages
+  "RUF002",  # allow ambiguous characters in docstrings
+  "RUF003",  # allow ambiguous characters in comments
+  "PLC0415",  # allow import outside top level
+  "PD",  # most PD rules are not helpful
+  "C901",  # complexity lints
+  "PLR0912",
+  "PLR0915",
+  "PLR2004",  # magic values
+  "N",  # naming
+  "FBT",  # boolean trap
+  "PLR0913",  # arguments in fucntion
+  "G004",  # f string in log
+  "T20",  # allow print
+  "PGH003", # type error suppression
+]
+extend-select = [
+  "PD002",  # pandas-use-of-inplace-argument
+  "PD007",  # pandas-use-of-dot-ix
+  "PD101",  # pandas-nunique-constant-series-check
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

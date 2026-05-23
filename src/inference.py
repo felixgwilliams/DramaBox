@@ -27,21 +27,17 @@ import argparse
 import json
 import logging
 import os
-import re
 import struct
-import sys
 import time
-from pathlib import Path
 
 import torch
 import torchaudio
 
+from .log import logger
+
 REPO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ltx2"))
 # ltx-pipelines already on path via ltx2/
 
-# Also add the local directory so audio_conditioning.py is importable
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 GEMMA_DIR = os.environ.get("GEMMA_DIR", "gemma-3-12b-it-qat-q4_0-unquantized")
@@ -68,7 +64,7 @@ def detect_model_type(checkpoint_path: str) -> str:
         version = metadata.get("model_version", "")
         if "distilled" in version.lower():
             return "distilled"
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     # Default to distilled (most common for audio-only)
     return "distilled"
@@ -76,11 +72,11 @@ def detect_model_type(checkpoint_path: str) -> str:
 
 # Duration estimator lives in duration_estimator.py so that text_chunker and
 # other tooling can import it without dragging the torch / LTX pipeline.
-from duration_estimator import (  # noqa: E402,F401
-    estimate_speech_duration,
+from .duration_estimator import (  # noqa: E402,F401
+    _LAUGH_VERBS,
     _contextual_laugh_duration,
     _estimate_nonverbal_duration,
-    _LAUGH_VERBS,
+    estimate_speech_duration,
 )
 
 
@@ -93,52 +89,79 @@ def parse_args():
     p.add_argument("--output", default="tts_output.wav")
 
     p.add_argument("--ref-duration", type=float, default=10.0, help="Seconds of voice reference to use")
-    p.add_argument("--gen-duration", type=float, default=0.0,
-                   help="Target output duration in seconds (0 = auto from prompt + multiplier). "
-                        "Set explicitly for long-form prompts (e.g. --gen-duration 30 for music). "
-                        "Outputs >20.5s automatically engage the end-of-clip silence-prior patch.")
-    p.add_argument("--pad-start", type=float, default=0.0,
-                   help="Prepend N seconds of silent padding, trimmed after decode (use 0 for clean starts)")
+    p.add_argument(
+        "--gen-duration",
+        type=float,
+        default=0.0,
+        help="Target output duration in seconds (0 = auto from prompt + multiplier). "
+        "Set explicitly for long-form prompts (e.g. --gen-duration 30 for music). "
+        "Outputs >20.5s automatically engage the end-of-clip silence-prior patch.",
+    )
+    p.add_argument(
+        "--pad-start",
+        type=float,
+        default=0.0,
+        help="Prepend N seconds of silent padding, trimmed after decode (use 0 for clean starts)",
+    )
     p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--duration-multiplier", type=float, default=1.0,
-                   help="Multiply auto-estimated duration by this factor (e.g. 1.1 for 10%% more breathing room)")
+    p.add_argument(
+        "--duration-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply auto-estimated duration by this factor (e.g. 1.1 for 10%% more breathing room)",
+    )
 
     p.add_argument("--checkpoint", default=os.path.join(MODEL_DIR, "ltx-2.3-audio-only.safetensors"))
     p.add_argument("--full-checkpoint", default=os.path.join(MODEL_DIR, "ltx-2.3-22b-distilled.safetensors"))
     p.add_argument("--gemma-root", default=GEMMA_DIR)
-    p.add_argument("--bnb-4bit", dest="bnb_4bit", action="store_true", default=True,
-                   help="Load Gemma text encoder via the bitsandbytes 4-bit path "
-                        "(required for the default unsloth/gemma-3-12b-it-bnb-4bit "
-                        "pre-quantized weights). Default: on.")
-    p.add_argument("--no-bnb-4bit", dest="bnb_4bit", action="store_false",
-                   help="Disable the bitsandbytes path (use only if --gemma-root "
-                        "points at an unquantized Gemma checkpoint).")
+    p.add_argument(
+        "--bnb-4bit",
+        dest="bnb_4bit",
+        action="store_true",
+        default=True,
+        help="Load Gemma text encoder via the bitsandbytes 4-bit path "
+        "(required for the default unsloth/gemma-3-12b-it-bnb-4bit "
+        "pre-quantized weights). Default: on.",
+    )
+    p.add_argument(
+        "--no-bnb-4bit",
+        dest="bnb_4bit",
+        action="store_false",
+        help="Disable the bitsandbytes path (use only if --gemma-root points at an unquantized Gemma checkpoint).",
+    )
     p.add_argument("--lora", default=None, help="Path to trained IC-LoRA .safetensors (audio-only)")
     p.add_argument("--lora-rank", type=int, default=128, help="LoRA rank (must match training)")
     p.add_argument("--id-guidance-scale", type=float, default=3.0, help="Identity guidance scale (0=disabled)")
     p.add_argument("--seed", type=int, default=42)
 
     # Auto-set based on model type but overridable
-    p.add_argument("--no-watermark", action="store_true",
-                   help="Skip Perth audio watermarking on the output (default: watermark on).")
-    p.add_argument("--sampler", choices=["euler", "heun"], default="euler",
-                   help="Denoising loop. 'heun' = jkass_quality 2nd-order predictor-corrector (~2x model calls, cleaner audio).")
+    p.add_argument(
+        "--no-watermark",
+        action="store_true",
+        help="Skip Perth audio watermarking on the output (default: watermark on).",
+    )
+    p.add_argument(
+        "--sampler",
+        choices=["euler", "heun"],
+        default="euler",
+        help="Denoising loop. 'heun' = jkass_quality 2nd-order predictor-corrector (~2x model calls, cleaner audio).",
+    )
     p.add_argument("--cfg-scale", type=float, default=None, help="CFG scale (auto: 1.0 distilled, 7.0 dev)")
     p.add_argument("--stg-scale", type=float, default=None, help="STG scale (auto: 0.0 distilled, 1.0 dev)")
     p.add_argument("--stg-block", type=int, default=29, help="Block index for STG perturbation")
-    p.add_argument("--rescale-scale", type=float, default=None,
-                   help="Latent CFG std-rescale (default auto: cfg-aware schedule that prevents "
-                        "output clipping at high cfg; pass any float in [0,1] to override).")
+    p.add_argument(
+        "--rescale-scale",
+        type=float,
+        default=None,
+        help="Latent CFG std-rescale (default auto: cfg-aware schedule that prevents output clipping at high cfg; pass any float in [0,1] to override).",
+    )
     p.add_argument("--modality-scale", type=float, default=None, help="Modality (auto: 1.0 distilled, 3.0 dev)")
     p.add_argument("--cfg-clamp", type=float, default=0.0, help="Clamp guided pred std to N * cond std (0=disabled)")
     p.add_argument("--steps", type=int, default=None, help="Override steps (auto: distilled sigmas / 30 dev)")
     p.add_argument("--fps", type=float, default=None, help="FPS (auto: 24.0 distilled, 25.0 dev)")
     p.add_argument(
         "--negative-prompt",
-        default=(
-            "worst quality, inconsistent motion, blurry, jittery, distorted, "
-            "robotic voice, echo, background noise, off-sync audio, repetitive speech"
-        ),
+        default=("worst quality, inconsistent motion, blurry, jittery, distorted, robotic voice, echo, background noise, off-sync audio, repetitive speech"),
         help="Negative prompt for CFG (dev model)",
     )
 
@@ -152,8 +175,6 @@ def main():
     t0 = time.time()
 
     # ---- Imports (deferred to avoid startup cost when checking --help) ----
-    from audio_conditioning import AudioConditionByReferenceLatent
-
     from ltx_core.batch_split import BatchSplitAdapter
     from ltx_core.components.diffusion_steps import EulerDiffusionStep
     from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -169,7 +190,7 @@ def main():
     from ltx_core.model.transformer.model import LTXModel, LTXModelType, X0Model
     from ltx_core.model.transformer.rope import LTXRopeType
     from ltx_core.tools import AudioLatentTools
-    from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoPixelShape
+    from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
     from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder, PromptEncoder
     from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
     from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
@@ -177,13 +198,15 @@ def main():
     from ltx_pipelines.utils.media_io import decode_audio_from_file
     from ltx_pipelines.utils.samplers import euler_denoising_loop, heun_denoising_loop
 
+    from .audio_conditioning import AudioConditionByReferenceLatent
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
     patchifier = AudioPatchifier(patch_size=1)
 
     # ---- Detect model type and set defaults ----
     model_type = detect_model_type(args.full_checkpoint)
-    logging.info(f"Detected model type: {model_type}")
+    logger.info(f"Detected model type: {model_type}")
 
     is_distilled = model_type == "distilled"
 
@@ -193,50 +216,47 @@ def main():
         args.stg_scale = 0.0 if is_distilled else 1.0
     if args.rescale_scale is None:
         # Auto cfg-aware rescale: imported from inference_server to keep one source of truth.
-        from inference_server import auto_rescale_for_cfg
+        from .inference_server import auto_rescale_for_cfg
+
         args.rescale_scale = 0.0 if is_distilled else auto_rescale_for_cfg(args.cfg_scale)
     if args.modality_scale is None:
         args.modality_scale = 1.0 if is_distilled else 3.0
     if args.fps is None:
         args.fps = 24.0 if is_distilled else 25.0
 
-    logging.info(
-        f"Params: cfg={args.cfg_scale}, stg={args.stg_scale}, rescale={args.rescale_scale}, "
-        f"modality={args.modality_scale}, fps={args.fps}"
-    )
+    logger.info(f"Params: cfg={args.cfg_scale}, stg={args.stg_scale}, rescale={args.rescale_scale}, modality={args.modality_scale}, fps={args.fps}")
 
     # ---- Auto duration ----
     if args.gen_duration <= 0:
         args.gen_duration = estimate_speech_duration(args.prompt, args.speed)
         if args.duration_multiplier != 1.0:
             args.gen_duration = round(args.gen_duration * args.duration_multiplier, 1)
-        logging.info(f"Auto duration: {args.gen_duration}s for {len(args.prompt)} chars"
-                     f"{f' (x{args.duration_multiplier})' if args.duration_multiplier != 1.0 else ''}")
+        logger.info(
+            f"Auto duration: {args.gen_duration}s for {len(args.prompt)} chars{f' (x{args.duration_multiplier})' if args.duration_multiplier != 1.0 else ''}"
+        )
 
     # ---- Compute target shape (include pad_start in duration) ----
     padded_duration = args.gen_duration + args.pad_start
-    raw_frames = int(round(padded_duration * args.fps)) + 1
+    raw_frames = round(padded_duration * args.fps) + 1
     num_frames = ((raw_frames - 1 + 4) // 8) * 8 + 1
     pixel_shape = VideoPixelShape(batch=1, frames=num_frames, height=64, width=64, fps=args.fps)
     tgt_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-    logging.info(f"Target shape: {tgt_shape} ({args.gen_duration}s, {num_frames} frames)")
+    logger.info(f"Target shape: {tgt_shape} ({args.gen_duration}s, {num_frames} frames)")
 
     # ---- AudioLatentTools for target ----
     audio_tools = AudioLatentTools(patchifier=patchifier, target_shape=tgt_shape)
 
     # ---- Create initial state ----
     state = audio_tools.create_initial_state(device, dtype)
-    logging.info(
-        f"Initial state: latent={state.latent.shape}, positions={state.positions.shape}, "
-        f"denoise_mask={state.denoise_mask.shape}"
-    )
+    logger.info(f"Initial state: latent={state.latent.shape}, positions={state.positions.shape}, denoise_mask={state.denoise_mask.shape}")
 
     if not args.no_ref and args.voice_sample:
         # ---- Encode voice reference ----
-        logging.info(f"Loading voice reference: {args.voice_sample}")
+        logger.info(f"Loading voice reference: {args.voice_sample}")
         voice = decode_audio_from_file(args.voice_sample, device, 0.0, args.ref_duration)
         if voice is None:
-            raise ValueError(f"Could not load audio from {args.voice_sample}")
+            msg = f"Could not load audio from {args.voice_sample}"
+            raise ValueError(msg)
 
         w = voice.waveform
         if w.dim() == 2:
@@ -256,38 +276,44 @@ def main():
         if peak > 0:
             target_peak = 10 ** (-4.0 / 20)  # -4dB
             w = w * (target_peak / peak)
-            logging.info(f"Normalized reference: peak {peak:.4f} -> {target_peak:.4f}")
+            logger.info(f"Normalized reference: peak {peak:.4f} -> {target_peak:.4f}")
 
         voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
 
-        logging.info("Encoding voice through Audio VAE...")
+        logger.info("Encoding voice through Audio VAE...")
         ac = AudioConditioner(checkpoint_path=args.full_checkpoint, dtype=dtype, device=device)
         ref_latent = ac(lambda enc: vae_encode_audio(voice, enc, None))
         del ac
         torch.cuda.empty_cache()
-        logging.info(f"Reference latent: {ref_latent.shape}")
+        logger.info(f"Reference latent: {ref_latent.shape}")
 
         # ---- Apply conditioning: append ref tokens to END ----
         conditioning = AudioConditionByReferenceLatent(latent=ref_latent.to(device, dtype), strength=1.0)
         state = conditioning.apply_to(latent_state=state, latent_tools=audio_tools)
-        logging.info(
+        logger.info(
             f"After conditioning: latent={state.latent.shape}, positions={state.positions.shape}, "
             f"attention_mask={'None' if state.attention_mask is None else state.attention_mask.shape}"
         )
     else:
-        logging.info("No voice reference — running raw base model")
+        logger.info("No voice reference — running raw base model")
 
     # ---- Apply noise ----
     generator = torch.Generator(device=device).manual_seed(args.seed)
     noiser = GaussianNoiser(generator=generator)
     noised_state = noiser(state, noise_scale=1.0)
-    logging.info("Applied Gaussian noise to state")
+    logger.info("Applied Gaussian noise to state")
 
     # ---- Encode prompt ----
     use_cfg = args.cfg_scale > 1.0
-    logging.info("Encoding prompt...")
-    pe = PromptEncoder(checkpoint_path=args.full_checkpoint, gemma_root=args.gemma_root, dtype=dtype, device=device,
-                       use_bnb_4bit=args.bnb_4bit, warm=True)
+    logger.info("Encoding prompt...")
+    pe = PromptEncoder(
+        checkpoint_path=args.full_checkpoint,
+        gemma_root=args.gemma_root,
+        dtype=dtype,
+        device=device,
+        use_bnb_4bit=args.bnb_4bit,
+        warm=True,
+    )
     prompts_to_encode = [args.prompt]
     if use_cfg:
         prompts_to_encode.append(args.negative_prompt)
@@ -296,13 +322,11 @@ def main():
     a_ctx_neg = ctx[1].audio_encoding if use_cfg else None
     del pe
     torch.cuda.empty_cache()
-    logging.info(f"Prompt encoded: a_ctx={a_ctx.shape}" + (f", a_ctx_neg={a_ctx_neg.shape}" if a_ctx_neg is not None else ""))
+    logger.info(f"Prompt encoded: a_ctx={a_ctx.shape}" + (f", a_ctx_neg={a_ctx_neg.shape}" if a_ctx_neg is not None else ""))
 
     # ---- Build audio-only model ----
-    logging.info("Building audio-only model...")
-    audio_only_sd_ops = SDOps("AO").with_matching(prefix="model.diffusion_model.").with_replacement(
-        "model.diffusion_model.", ""
-    )
+    logger.info("Building audio-only model...")
+    audio_only_sd_ops = SDOps("AO").with_matching(prefix="model.diffusion_model.").with_replacement("model.diffusion_model.", "")
 
     class AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
         @classmethod
@@ -348,11 +372,11 @@ def main():
         from peft import LoraConfig, get_peft_model
         from safetensors.torch import load_file as st_load
 
-        logging.info(f"Loading LoRA: {args.lora}")
+        logger.info(f"Loading LoRA: {args.lora}")
         lora_sd = st_load(args.lora)
 
-        is_peft_format = any("base_model.model." in k for k in lora_sd.keys())
-        is_original_idlora = any("diffusion_model." in k for k in lora_sd.keys())
+        is_peft_format = any("base_model.model." in k for k in lora_sd)
+        is_original_idlora = any("diffusion_model." in k for k in lora_sd)
 
         lora_config = LoraConfig(
             r=args.lora_rank,
@@ -383,29 +407,25 @@ def main():
                 if ".lora_B.weight" in k and ".lora_B.default.weight" not in k:
                     new_key = k.replace(".lora_B.weight", ".lora_B.default.weight")
                 mapped_sd[new_key] = v
-            missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
+            _missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
             loaded = len(mapped_sd) - len(unexpected)
-            logging.info(f"Loaded {loaded} LoRA weights (peft format)")
+            logger.info(f"Loaded {loaded} LoRA weights (peft format)")
         elif is_original_idlora:
-            audio_keys = {
-                k: v
-                for k, v in lora_sd.items()
-                if "audio_attn1" in k or "audio_attn2" in k or "audio_ff" in k
-            }
+            audio_keys = {k: v for k, v in lora_sd.items() if "audio_attn1" in k or "audio_attn2" in k or "audio_ff" in k}
             mapped_sd = {}
             for k, v in audio_keys.items():
                 new_key = k.replace("diffusion_model.", "base_model.model.")
                 new_key = new_key.replace(".lora_A.weight", ".lora_A.default.weight")
                 new_key = new_key.replace(".lora_B.weight", ".lora_B.default.weight")
                 mapped_sd[new_key] = v
-            missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
+            _missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
             loaded = len(mapped_sd) - len(unexpected)
-            logging.info(f"Loaded {loaded} LoRA weights (original ID-LoRA)")
+            logger.info(f"Loaded {loaded} LoRA weights (original ID-LoRA)")
 
         velocity_model = velocity_model.merge_and_unload()
-        logging.info("Merged LoRA into model")
+        logger.info("Merged LoRA into model")
 
-    logging.info(f"Model: {sum(p.numel() for p in velocity_model.parameters()) / 1e9:.1f}B params")
+    logger.info(f"Model: {sum(p.numel() for p in velocity_model.parameters()) / 1e9:.1f}B params")
 
     # ---- Wrap velocity model in X0Model ----
     x0_model = X0Model(velocity_model)
@@ -417,14 +437,14 @@ def main():
     if is_distilled:
         if args.steps is not None and args.steps > 0:
             sigmas = LTX2Scheduler().execute(steps=args.steps, latent=noised_state.latent).to(device)
-            logging.info(f"Distilled with custom {args.steps}-step schedule")
+            logger.info(f"Distilled with custom {args.steps}-step schedule")
         else:
             sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=device)
-            logging.info(f"Distilled {len(DISTILLED_SIGMA_VALUES) - 1}-step schedule")
+            logger.info(f"Distilled {len(DISTILLED_SIGMA_VALUES) - 1}-step schedule")
     else:
         steps = args.steps if args.steps is not None and args.steps > 0 else 30
         sigmas = LTX2Scheduler().execute(steps=steps, latent=noised_state.latent).to(device)
-        logging.info(f"Dev {steps}-step schedule")
+        logger.info(f"Dev {steps}-step schedule")
 
     # ---- Denoiser: use GuidedDenoiser if any guidance is active, SimpleDenoiser otherwise ----
     needs_guidance = args.cfg_scale > 1.0 or args.stg_scale > 0.0 or args.modality_scale > 1.0
@@ -446,16 +466,15 @@ def main():
             video_guider=None,
             audio_guider=audio_guider,
         )
-        logging.info(f"GuidedDenoiser: cfg={args.cfg_scale}, stg={args.stg_scale}, "
-                     f"rescale={args.rescale_scale}, modality={args.modality_scale}")
+        logger.info(f"GuidedDenoiser: cfg={args.cfg_scale}, stg={args.stg_scale}, rescale={args.rescale_scale}, modality={args.modality_scale}")
     else:
         denoiser = SimpleDenoiser(v_context=None, a_context=a_ctx)
-        logging.info("SimpleDenoiser (no guidance)")
+        logger.info("SimpleDenoiser (no guidance)")
 
-    logging.info(f"Sigmas: {sigmas.tolist()}")
+    logger.info(f"Sigmas: {sigmas.tolist()}")
 
     # ---- Denoising loop ----
-    logging.info(f"Running denoising loop ({len(sigmas) - 1} steps)...")
+    logger.info(f"Running denoising loop ({len(sigmas) - 1} steps)...")
     with gpu_model(x0_model) as model:
         batched_model = BatchSplitAdapter(model, max_batch_size=1)
 
@@ -473,10 +492,10 @@ def main():
     torch.cuda.empty_cache()
 
     # ---- Strip ref tokens and unpatchify ----
-    logging.info("Stripping conditioning and unpatchifying...")
+    logger.info("Stripping conditioning and unpatchifying...")
     audio_state = audio_tools.clear_conditioning(audio_state)
     audio_state = audio_tools.unpatchify(audio_state)
-    logging.info(f"Final latent shape: {audio_state.latent.shape}")
+    logger.info(f"Final latent shape: {audio_state.latent.shape}")
 
     # ---- End-of-clip silence-prior fix ----
     # Base LTX-2.3 22B was trained on audio clips ≤ ~20 s and learned a strong
@@ -495,7 +514,7 @@ def main():
         latent_in = patched
 
     # ---- Decode audio ----
-    logging.info("Decoding audio...")
+    logger.info("Decoding audio...")
     ad = AudioDecoder(checkpoint_path=args.full_checkpoint, dtype=dtype, device=device)
     decoded = ad(latent_in)
     del ad
@@ -510,7 +529,7 @@ def main():
     if args.pad_start > 0:
         trim_samples = int(args.pad_start * sr)
         wav = wav[..., trim_samples:]
-        logging.info(f"Trimmed {args.pad_start}s ({trim_samples} samples) of start padding")
+        logger.info(f"Trimmed {args.pad_start}s ({trim_samples} samples) of start padding")
 
     # Apply Perth (Perceptual Threshold) imperceptible neural watermark — see
     # https://github.com/resemble-ai/perth. Mono waveform required; if stereo,
@@ -519,22 +538,23 @@ def main():
     wav_cpu = wav.float().cpu()
     if not getattr(args, "no_watermark", False):
         try:
-            import perth
             import numpy as np
+            import perth
+
             wm = perth.PerthImplicitWatermarker()
             mono = wav_cpu.mean(dim=0).numpy() if wav_cpu.shape[0] > 1 else wav_cpu[0].numpy()
             mono_wm = wm.apply_watermark(mono, sample_rate=sr)
             mono_wm_t = torch.from_numpy(np.asarray(mono_wm, dtype=np.float32)).unsqueeze(0)
             wav_cpu = mono_wm_t if wav_cpu.shape[0] == 1 else mono_wm_t.repeat(wav_cpu.shape[0], 1)
-        except Exception as e:
-            logging.warning(f"Perth watermark skipped ({e})")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Perth watermark skipped ({e})")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torchaudio.save(args.output, wav_cpu, sr)
 
     elapsed = time.time() - t0
-    logging.info(f"Output: {args.output} ({wav.shape[-1] / sr:.1f}s)")
-    logging.info(f"Total time: {elapsed:.1f}s")
+    logger.info(f"Output: {args.output} ({wav.shape[-1] / sr:.1f}s)")
+    logger.info(f"Total time: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":

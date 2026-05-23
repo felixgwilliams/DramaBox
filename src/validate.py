@@ -8,6 +8,7 @@ settings default to the Gradio warm-server values (cfg=2.5, stg=1.5,
 modality=1.0, rescale=0, 30 steps, fps=25) — use --inference-params to
 override.
 """
+
 import argparse
 import logging
 import os
@@ -18,9 +19,10 @@ import traceback
 import torch
 import torchaudio
 
+from .log import logger
+
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = REPO_DIR
-sys.path.insert(0, os.path.join(REPO_DIR, "ltx2"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 DEV_FULL_CKPT = os.environ.get(
@@ -52,15 +54,16 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--duration-multiplier", type=float, default=1.1)
     # Match Gradio / inference_server.py DEFAULT_NEG exactly
-    p.add_argument("--negative-prompt", default=(
-        "worst quality, inconsistent, robotic, distorted, noise, static, "
-        "muffled, unclear, unnatural, monotone"
-    ))
+    p.add_argument(
+        "--negative-prompt",
+        default=("worst quality, inconsistent, robotic, distorted, noise, static, muffled, unclear, unnatural, monotone"),
+    )
     return p.parse_args()
 
 
 def estimate_speech_duration(prompt: str, speed: float = 1.0) -> float:
     import re
+
     quoted = re.findall(r'"([^"]*)"', prompt) or re.findall(r"'([^']*)'", prompt)
     text = " ".join(quoted) if quoted else prompt
     duration = len(text) * 0.065 / max(speed, 0.1) + 1.5
@@ -68,11 +71,11 @@ def estimate_speech_duration(prompt: str, speed: float = 1.0) -> float:
 
 
 class WarmValidator:
-    def __init__(self, full_checkpoint, gemma_root, lora_path=None, lora_rank=128,
-                 device="cuda", dtype=torch.bfloat16):
-        from audio_conditioning import AudioConditionByReferenceLatent  # noqa: F401 (imported by inference.py)
+    def __init__(self, full_checkpoint, gemma_root, lora_path=None, lora_rank=128, device="cuda", dtype=torch.bfloat16):
         from ltx_core.components.patchifiers import AudioPatchifier
-        from ltx_pipelines.utils.blocks import PromptEncoder, AudioConditioner, AudioDecoder
+        from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder, PromptEncoder
+
+        from .audio_conditioning import AudioConditionByReferenceLatent  # noqa: F401 (imported by inference.py)
 
         self.device = torch.device(device)
         self.dtype = dtype
@@ -80,33 +83,42 @@ class WarmValidator:
         self.gemma_root = gemma_root
         self.patchifier = AudioPatchifier(patch_size=1)
 
-        logging.info("Loading PromptEncoder (Gemma + embeddings_processor)...")
+        logger.info("Loading PromptEncoder (Gemma + embeddings_processor)...")
         t0 = time.time()
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path=full_checkpoint, gemma_root=gemma_root,
-            dtype=dtype, device=self.device, warm=True, audio_only=True,
+            checkpoint_path=full_checkpoint,
+            gemma_root=gemma_root,
+            dtype=dtype,
+            device=self.device,
+            warm=True,
+            audio_only=True,
         )
-        logging.info(f"  PromptEncoder ready in {time.time()-t0:.1f}s")
+        logger.info(f"  PromptEncoder ready in {time.time() - t0:.1f}s")
 
-        logging.info("Loading AudioConditioner (audio VAE encoder)...")
+        logger.info("Loading AudioConditioner (audio VAE encoder)...")
         t0 = time.time()
         self.audio_conditioner = AudioConditioner(
-            checkpoint_path=full_checkpoint, dtype=dtype, device=self.device, warm=True,
+            checkpoint_path=full_checkpoint,
+            dtype=dtype,
+            device=self.device,
+            warm=True,
         )
-        logging.info(f"  AudioConditioner ready in {time.time()-t0:.1f}s")
+        logger.info(f"  AudioConditioner ready in {time.time() - t0:.1f}s")
 
-        logging.info("Loading AudioDecoder...")
+        logger.info("Loading AudioDecoder...")
         t0 = time.time()
         self.audio_decoder = AudioDecoder(
-            checkpoint_path=full_checkpoint, dtype=dtype, device=self.device, warm=True,
+            checkpoint_path=full_checkpoint,
+            dtype=dtype,
+            device=self.device,
+            warm=True,
         )
-        logging.info(f"  AudioDecoder ready in {time.time()-t0:.1f}s")
+        logger.info(f"  AudioDecoder ready in {time.time() - t0:.1f}s")
 
-        logging.info("Building velocity model (audio-only from base dev)...")
+        logger.info("Building velocity model (audio-only from base dev)...")
         t0 = time.time()
         self.velocity_model = self._build_velocity_model(full_checkpoint, lora_path, lora_rank)
-        logging.info(f"  Velocity model ready in {time.time()-t0:.1f}s "
-                     f"({sum(p.numel() for p in self.velocity_model.parameters()) / 1e9:.1f}B params)")
+        logger.info(f"  Velocity model ready in {time.time() - t0:.1f}s ({sum(p.numel() for p in self.velocity_model.parameters()) / 1e9:.1f}B params)")
 
     def _build_velocity_model(self, checkpoint_path, lora_path, lora_rank):
         from ltx_core.loader.registry import DummyRegistry
@@ -117,11 +129,7 @@ class WarmValidator:
         from ltx_core.model.transformer.model import LTXModel, LTXModelType
         from ltx_core.model.transformer.rope import LTXRopeType
 
-        sd_ops = (
-            SDOps("AO")
-            .with_matching(prefix="model.diffusion_model.")
-            .with_replacement("model.diffusion_model.", "")
-        )
+        sd_ops = SDOps("AO").with_matching(prefix="model.diffusion_model.").with_replacement("model.diffusion_model.", "")
 
         class Cfg(ModelConfigurator[LTXModel]):
             @classmethod
@@ -130,6 +138,7 @@ class WarmValidator:
                 cp = None
                 if not t.get("caption_proj_before_connector", False):
                     from ltx_core.model.transformer.text_projection import create_caption_projection
+
                     with torch.device("meta"):
                         cp = create_caption_projection(t, audio=True)
                 return LTXModel(
@@ -154,26 +163,37 @@ class WarmValidator:
                 )
 
         builder = Builder(
-            model_path=checkpoint_path, model_class_configurator=Cfg,
-            model_sd_ops=sd_ops, registry=DummyRegistry(),
+            model_path=checkpoint_path,
+            model_class_configurator=Cfg,
+            model_sd_ops=sd_ops,
+            registry=DummyRegistry(),
         )
         velocity = builder.build(device=self.device, dtype=self.dtype).to(self.device).eval()
 
         if lora_path and os.path.exists(lora_path):
             from peft import LoraConfig, get_peft_model
             from safetensors.torch import load_file as st_load
-            logging.info(f"Attaching LoRA: {lora_path}")
+
+            logger.info(f"Attaching LoRA: {lora_path}")
             lora_sd = st_load(lora_path)
-            is_peft = any("base_model.model." in k for k in lora_sd.keys())
-            is_iclora = any("diffusion_model." in k for k in lora_sd.keys())
+            is_peft = any("base_model.model." in k for k in lora_sd)
+            is_iclora = any("diffusion_model." in k for k in lora_sd)
             cfg = LoraConfig(
-                r=lora_rank, lora_alpha=lora_rank, lora_dropout=0.0, bias="none",
+                r=lora_rank,
+                lora_alpha=lora_rank,
+                lora_dropout=0.0,
+                bias="none",
                 target_modules=[
-                    "audio_attn1.to_k", "audio_attn1.to_q",
-                    "audio_attn1.to_v", "audio_attn1.to_out.0",
-                    "audio_attn2.to_k", "audio_attn2.to_q",
-                    "audio_attn2.to_v", "audio_attn2.to_out.0",
-                    "audio_ff.net.0.proj", "audio_ff.net.2",
+                    "audio_attn1.to_k",
+                    "audio_attn1.to_q",
+                    "audio_attn1.to_v",
+                    "audio_attn1.to_out.0",
+                    "audio_attn2.to_k",
+                    "audio_attn2.to_q",
+                    "audio_attn2.to_v",
+                    "audio_attn2.to_out.0",
+                    "audio_ff.net.0.proj",
+                    "audio_ff.net.2",
                 ],
             )
             velocity = get_peft_model(velocity, cfg)
@@ -188,10 +208,9 @@ class WarmValidator:
                         nk = k.replace(".lora_B.weight", ".lora_B.default.weight")
                     mapped[nk] = v
                 _, unexpected = velocity.load_state_dict(mapped, strict=False)
-                logging.info(f"  Loaded {len(mapped) - len(unexpected)} LoRA weights (peft)")
+                logger.info(f"  Loaded {len(mapped) - len(unexpected)} LoRA weights (peft)")
             elif is_iclora:
-                audio_keys = {k: v for k, v in lora_sd.items()
-                              if "audio_attn1" in k or "audio_attn2" in k or "audio_ff" in k}
+                audio_keys = {k: v for k, v in lora_sd.items() if "audio_attn1" in k or "audio_attn2" in k or "audio_ff" in k}
                 mapped = {}
                 for k, v in audio_keys.items():
                     nk = k.replace("diffusion_model.", "base_model.model.")
@@ -199,16 +218,15 @@ class WarmValidator:
                     nk = nk.replace(".lora_B.weight", ".lora_B.default.weight")
                     mapped[nk] = v
                 _, unexpected = velocity.load_state_dict(mapped, strict=False)
-                logging.info(f"  Loaded {len(mapped) - len(unexpected)} LoRA weights (iclora)")
+                logger.info(f"  Loaded {len(mapped) - len(unexpected)} LoRA weights (iclora)")
 
             velocity = velocity.merge_and_unload()
-            logging.info("  Merged LoRA into base weights")
+            logger.info("  Merged LoRA into base weights")
 
         return velocity
 
     @torch.inference_mode()
     def generate(self, prompt, output_path, voice_ref=None, args=None):
-        from audio_conditioning import AudioConditionByReferenceLatent
         from ltx_core.batch_split import BatchSplitAdapter
         from ltx_core.components.diffusion_steps import EulerDiffusionStep
         from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -219,15 +237,16 @@ class WarmValidator:
         from ltx_core.tools import AudioLatentTools
         from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
         from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
-        from ltx_pipelines.utils.gpu_model import gpu_model
         from ltx_pipelines.utils.media_io import decode_audio_from_file
         from ltx_pipelines.utils.samplers import euler_denoising_loop
+
+        from .audio_conditioning import AudioConditionByReferenceLatent
 
         t_total = time.time()
 
         # ---- Duration + shape ----
         gen_dur = estimate_speech_duration(prompt) * args.duration_multiplier
-        raw_frames = int(round(gen_dur * args.fps)) + 1
+        raw_frames = round(gen_dur * args.fps) + 1
         num_frames = ((raw_frames - 1 + 4) // 8) * 8 + 1
         pixel_shape = VideoPixelShape(batch=1, frames=num_frames, height=64, width=64, fps=args.fps)
         tgt_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
@@ -256,7 +275,8 @@ class WarmValidator:
                 voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
                 ref_latent = self.audio_conditioner(lambda enc: vae_encode_audio(voice, enc, None))
                 cond = AudioConditionByReferenceLatent(
-                    latent=ref_latent.to(self.device, self.dtype), strength=1.0,
+                    latent=ref_latent.to(self.device, self.dtype),
+                    strength=1.0,
                 )
                 state = cond.apply_to(latent_state=state, latent_tools=audio_tools)
 
@@ -277,7 +297,8 @@ class WarmValidator:
         if needs_guidance:
             guider = MultiModalGuider(
                 params=MultiModalGuiderParams(
-                    cfg_scale=args.cfg_scale, stg_scale=args.stg_scale,
+                    cfg_scale=args.cfg_scale,
+                    stg_scale=args.stg_scale,
                     stg_blocks=[args.stg_block] if args.stg_scale > 0 else [],
                     rescale_scale=args.rescale_scale,
                     modality_scale=args.modality_scale,
@@ -286,8 +307,10 @@ class WarmValidator:
                 negative_context=a_ctx_neg,
             )
             denoiser = GuidedDenoiser(
-                v_context=None, a_context=a_ctx,
-                video_guider=None, audio_guider=guider,
+                v_context=None,
+                a_context=a_ctx,
+                video_guider=None,
+                audio_guider=guider,
             )
         else:
             denoiser = SimpleDenoiser(v_context=None, a_context=a_ctx)
@@ -301,8 +324,12 @@ class WarmValidator:
         x0 = X0Model(self.velocity_model)
         batched = BatchSplitAdapter(x0, max_batch_size=1)
         _, audio_state = euler_denoising_loop(
-            sigmas=sigmas, video_state=None, audio_state=state,
-            stepper=EulerDiffusionStep(), transformer=batched, denoiser=denoiser,
+            sigmas=sigmas,
+            video_state=None,
+            audio_state=state,
+            stepper=EulerDiffusionStep(),
+            transformer=batched,
+            denoiser=denoiser,
         )
 
         audio_state = audio_tools.clear_conditioning(audio_state)
@@ -314,14 +341,14 @@ class WarmValidator:
             wav = wav.unsqueeze(0)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         torchaudio.save(output_path, wav.float().cpu(), decoded.sampling_rate)
-        logging.info(f"  -> {output_path} ({wav.shape[-1]/decoded.sampling_rate:.1f}s, "
-                     f"{time.time()-t_total:.1f}s)")
+        logger.info(f"  -> {output_path} ({wav.shape[-1] / decoded.sampling_rate:.1f}s, {time.time() - t_total:.1f}s)")
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
     import yaml
+
     with open(args.val_config) as f:
         val_cfg = yaml.safe_load(f)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -349,14 +376,13 @@ def main():
                 args=args,
             )
             n_ok += 1
-            logging.info(f"  [{name}] OK")
-        except Exception as e:
+            logger.info(f"  [{name}] OK")
+        except Exception as e:  # noqa: BLE001
             n_fail += 1
-            logging.warning(f"  [{name}] FAILED: {e}")
+            logger.warning(f"  [{name}] FAILED: {e}")
             traceback.print_exc()
 
-    logging.info(f"Validation done: ok={n_ok} fail={n_fail} in {(time.time()-t0)/60:.1f}min "
-                 f"at {args.output_dir}")
+    logger.info(f"Validation done: ok={n_ok} fail={n_fail} in {(time.time() - t0) / 60:.1f}min at {args.output_dir}")
 
 
 if __name__ == "__main__":

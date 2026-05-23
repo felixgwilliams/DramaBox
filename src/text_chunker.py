@@ -10,12 +10,11 @@ Chunking is quote-aware (sentence terminators inside ``"..."`` don't count)
 and preserves the speaker-description prefix on every chunk so the model keeps
 the same persona / delivery style across joins.
 """
+
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional
-
 
 # Matches the leading speaker description, ending at the first comma that's
 # directly followed by a space + opening quote. Anything before that is treated
@@ -31,7 +30,7 @@ class PromptChunk:
     est_duration_s: float
 
 
-def extract_speaker_prefix(prompt: str) -> tuple[Optional[str], str]:
+def extract_speaker_prefix(prompt: str) -> tuple[str | None, str]:
     """Return ``(prefix, body)`` where ``prefix`` is the speaker description.
 
     If the prompt has the canonical ``"<persona>, "<dialogue>"..."`` form, the
@@ -42,10 +41,10 @@ def extract_speaker_prefix(prompt: str) -> tuple[Optional[str], str]:
     m = _PREFIX_RE.match(prompt)
     if not m:
         return None, prompt
-    return m.group(1).strip(), prompt[m.end():]
+    return m.group(1).strip(), prompt[m.end() :]
 
 
-def split_sentences_outside_quotes(text: str) -> List[str]:
+def split_sentences_outside_quotes(text: str) -> list[str]:
     """Split ``text`` into sentences, ignoring terminators inside quotes.
 
     A "sentence" here is a span ending in ``.``/``!``/``?`` (optionally followed
@@ -56,8 +55,8 @@ def split_sentences_outside_quotes(text: str) -> List[str]:
         >>> split_sentences_outside_quotes('He says, "Hi, how are you?" Then leaves.')
         ['He says, "Hi, how are you?"', 'Then leaves.']
     """
-    sentences: List[str] = []
-    buf: List[str] = []
+    sentences: list[str] = []
+    buf: list[str] = []
     in_double = False
     in_single = False
     i = 0
@@ -71,7 +70,7 @@ def split_sentences_outside_quotes(text: str) -> List[str]:
             in_double = not in_double
             # Treat the *closing* quote as a sentence boundary if the last
             # meaningful char inside it was a terminator: ``...how are you?"``.
-            if was_inside and len(buf) >= 2 and buf[-2] in ".!?":
+            if was_inside and len(buf) >= 2 and buf[-2] in ".!?":  # noqa: SIM102
                 # Boundary requires whitespace / end-of-string after.
                 if i + 1 >= n or text[i + 1].isspace():
                     sentence = "".join(buf).strip()
@@ -91,7 +90,7 @@ def split_sentences_outside_quotes(text: str) -> List[str]:
         elif ch in ".!?" and not in_double and not in_single:
             # Greedily eat trailing closing quotes / punctuation.
             j = i + 1
-            while j < n and text[j] in '."\')]':
+            while j < n and text[j] in ".\"')]":
                 buf.append(text[j])
                 if text[j] == '"':
                     in_double = not in_double  # closing quote toggle
@@ -111,7 +110,7 @@ def split_sentences_outside_quotes(text: str) -> List[str]:
     return sentences
 
 
-def _assemble(prefix: Optional[str], sentences: List[str]) -> str:
+def _assemble(prefix: str | None, sentences: list[str]) -> str:
     body = " ".join(s.strip() for s in sentences if s.strip())
     if not prefix:
         return body
@@ -128,7 +127,7 @@ def chunk_prompt_for_duration(
     max_duration_s: float = 45.0,
     target_duration_s: float = 37.0,
     duration_multiplier: float = 1.1,
-) -> List[PromptChunk]:
+) -> list[PromptChunk]:
     """Split ``prompt`` into <= ``max_duration_s`` chunks.
 
     Args:
@@ -147,7 +146,7 @@ def chunk_prompt_for_duration(
         List of :class:`PromptChunk`. Single-chunk prompts return a 1-element
         list with the original prompt unchanged.
     """
-    from duration_estimator import estimate_speech_duration
+    from .duration_estimator import estimate_speech_duration
 
     def _est(t: str) -> float:
         return estimate_speech_duration(t) * duration_multiplier
@@ -163,12 +162,12 @@ def chunk_prompt_for_duration(
         # chunking so we still produce SOMETHING under the cap.
         sentences = body.split()
 
-    chunks: List[PromptChunk] = []
-    current: List[str] = []
+    chunks: list[PromptChunk] = []
+    current: list[str] = []
     current_dur = 0.0
 
     for sent in sentences:
-        candidate = _assemble(prefix, current + [sent])
+        candidate = _assemble(prefix, [*current, sent])
         cand_dur = _est(candidate)
 
         if current and cand_dur > target_duration_s:

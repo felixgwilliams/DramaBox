@@ -1,8 +1,6 @@
 """Audio reference conditioning item for IC-LoRA voice cloning."""
 
 import torch
-
-from ltx_core.components.patchifiers import AudioPatchifier
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.tools import AudioLatentTools
 from ltx_core.types import AudioLatentShape, LatentState

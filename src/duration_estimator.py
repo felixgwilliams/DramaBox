@@ -5,10 +5,10 @@ unit tests can import it without dragging torch + the LTX pipeline through
 sys.path. ``inference.py`` and ``inference_server.py`` continue to import
 ``estimate_speech_duration`` from here.
 """
+
 from __future__ import annotations
 
 import re
-
 
 _LAUGH_VERBS = {
     # base seconds per occurrence; gets scaled by the modifier found nearby.
@@ -33,18 +33,18 @@ def _contextual_laugh_duration(text: str) -> float:
     Also reward phonetic repetition inside quotes -- 'Hahahahahaha' buys more
     time than 'Haha' -- at ~0.2s per extra repeated syllable.
     """
-    short_mod = re.compile(
-        r"^\s*(?:[a-z]+ly )?(?:briefly|shortly|once|quickly)",
-        re.IGNORECASE)
+    short_mod = re.compile(r"^\s*(?:[a-z]+ly )?(?:briefly|shortly|once|quickly)", re.IGNORECASE)
     long_mod = re.compile(
         r"^\s*(?:[a-z]+ly )?(?:maniacally|heartily|uproariously|uncontrollably|"
         r"hysterically|darkly|wickedly|evilly|loudly|long)"
-        r"|^\s*between phrases", re.IGNORECASE)
+        r"|^\s*between phrases",
+        re.IGNORECASE,
+    )
 
     total = 0.0
     for pat, base_dur in _LAUGH_VERBS.items():
         for m in re.finditer(pat, text, re.IGNORECASE):
-            ctx = text[m.end(): m.end() + 40]
+            ctx = text[m.end() : m.end() + 40]
             if short_mod.match(ctx):
                 total += base_dur * 0.4
             elif long_mod.match(ctx):
@@ -69,26 +69,44 @@ def _estimate_nonverbal_duration(text: str) -> float:
     quotes.
     """
     PATTERNS = {
-        r'\bsighs?\b': 0.8, r'\bshaky breath\b': 1.0, r'\bbreathing deeply\b': 1.0,
-        r'\bgasps?\b': 0.5, r'\bburps?\b': 0.5, r'\byawns?\b': 1.0,
-        r'\bpants?\b': 0.8, r'\bwheezes?\b': 0.8, r'\bcoughs?\b': 0.8,
-        r'\bsniffles?\b': 0.5, r'\bsnorts?\b': 0.3, r'\bgroans?\b': 0.8,
-        r'\blong pause\b': 1.0, r'\bpauses? briefly\b': 0.3,
-        r'\bpauses?\b': 0.5, r'\bsilence\b': 1.0,
-        r'\blets? the .{1,20} hang\b': 1.0, r'\blets? .{1,20} sink in\b': 1.0,
-        r'\bslams?\b': 0.5, r'\bclaps?\b': 0.3,
-        r'\bdraws? (?:his|her|a) sword\b': 0.5,
-        r'\btakes? a (?:drag|swig|sip|drink)\b': 0.5,
-        r'\bwhistles?\b': 1.0, r'\bhums?\b': 0.8,
-        r'\bmutters?\b': 1.5, r'\bmumbles?\b': 1.0, r'\bwhispers?\b': 0.0,
-        r'\bclears? (?:his|her) throat\b': 0.5, r'\bgulps?\b': 0.5,
-        r'\bswallows?\b': 0.5,
-        r'\bvoice (?:breaks?|cracks?|trembles?|drops?|rises?)\b': 0.5,
-        r'\bsteadies? (?:him|her)self\b': 1.0,
-        r'\bcatches? (?:his|her) breath\b': 1.0,
-        r'\bcomposes? (?:him|her)self\b': 0.8,
-        r'\bdemeanor shifts?\b': 0.5, r'\bsettles? in\b': 0.5,
-        r'\bleans? in\b': 0.3, r'\bwipes? (?:his|her) eyes\b': 0.5,
+        r"\bsighs?\b": 0.8,
+        r"\bshaky breath\b": 1.0,
+        r"\bbreathing deeply\b": 1.0,
+        r"\bgasps?\b": 0.5,
+        r"\bburps?\b": 0.5,
+        r"\byawns?\b": 1.0,
+        r"\bpants?\b": 0.8,
+        r"\bwheezes?\b": 0.8,
+        r"\bcoughs?\b": 0.8,
+        r"\bsniffles?\b": 0.5,
+        r"\bsnorts?\b": 0.3,
+        r"\bgroans?\b": 0.8,
+        r"\blong pause\b": 1.0,
+        r"\bpauses? briefly\b": 0.3,
+        r"\bpauses?\b": 0.5,
+        r"\bsilence\b": 1.0,
+        r"\blets? the .{1,20} hang\b": 1.0,
+        r"\blets? .{1,20} sink in\b": 1.0,
+        r"\bslams?\b": 0.5,
+        r"\bclaps?\b": 0.3,
+        r"\bdraws? (?:his|her|a) sword\b": 0.5,
+        r"\btakes? a (?:drag|swig|sip|drink)\b": 0.5,
+        r"\bwhistles?\b": 1.0,
+        r"\bhums?\b": 0.8,
+        r"\bmutters?\b": 1.5,
+        r"\bmumbles?\b": 1.0,
+        r"\bwhispers?\b": 0.0,
+        r"\bclears? (?:his|her) throat\b": 0.5,
+        r"\bgulps?\b": 0.5,
+        r"\bswallows?\b": 0.5,
+        r"\bvoice (?:breaks?|cracks?|trembles?|drops?|rises?)\b": 0.5,
+        r"\bsteadies? (?:him|her)self\b": 1.0,
+        r"\bcatches? (?:his|her) breath\b": 1.0,
+        r"\bcomposes? (?:him|her)self\b": 0.8,
+        r"\bdemeanor shifts?\b": 0.5,
+        r"\bsettles? in\b": 0.5,
+        r"\bleans? in\b": 0.3,
+        r"\bwipes? (?:his|her) eyes\b": 0.5,
     }
     extra = 0.0
     for pattern, dur in PATTERNS.items():
