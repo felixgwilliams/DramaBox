@@ -8,11 +8,9 @@ dependencies = [
   "av>=12.0.0",
   "bitsandbytes>=0.45.0",
   "einops>=0.7.0",
-  "gradio==5.7.1",
   "hf-xet>=1.5.0",
   "huggingface-hub>=0.20.0,<1.0",
   "peft>=0.7.0",
-  "pydantic==2.10.6",
   "pyyaml>=6.0",
   "resemble-perth",
   "safetensors>=0.4.0",
@@ -24,6 +22,13 @@ dependencies = [
   "transformers>=4.45.0",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+gradio = [
+  "gradio==5.7.1",
+  "pydantic==2.10.6",
+
+]
 
 [dependency-groups]
 dev = [
@@ -78,7 +83,7 @@ ignore = [
   "PLR0913",  # arguments in fucntion
   "G004",  # f string in log
   "T20",  # allow print
-  "PGH003", # type error suppression
+  "PGH003",  # type error suppression
 ]
 extend-select = [
   "PD002",  # pandas-use-of-inplace-argument
